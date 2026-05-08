@@ -1,0 +1,32 @@
+{
+  "name": "ssh2ng",
+  "version": "0.0.1",
+  "description": "ssh2-compatible API on top of libssh — drop-in replacement that honors ~/.ssh/config (ProxyJump, ProxyCommand, IdentityFile, agent, certificates).",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib/",
+    "src/",
+    "binding.gyp",
+    "README.md"
+  ],
+  "scripts": {
+    "build:native": "node-gyp rebuild",
+    "build:ts": "tsc",
+    "build": "npm run build:native && npm run build:ts",
+    "test": "bun test",
+    "example:connect": "bun run examples/connect.ts"
+  },
+  "keywords": ["ssh", "ssh2", "libssh", "sftp", "ssh-client"],
+  "author": "Dmitry Mikushin",
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^8.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "node-gyp": "^11.0.0",
+    "typescript": "^5.7.0"
+  },
+  "gypfile": true
+}
