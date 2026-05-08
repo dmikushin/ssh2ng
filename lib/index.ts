@@ -46,11 +46,13 @@ function findNativeAddon(): string {
 
 const native = require(findNativeAddon()) as {
   SshSession: new () => NativeSession
+  SshExecChannel: new (session: NativeSession, command: string, stdin?: Buffer) => NativeExecChannel
 }
 
 interface NativeSession {
   connect(opts: { host: string; username?: string; port?: number; timeoutSec?: number; acceptAnyHostKey?: boolean }): Promise<void>
   exec(cmd: string, stdin?: Buffer): Promise<{ stdout: Buffer; stderr: Buffer; code: number }>
+  execStream(cmd: string, stdin?: Buffer): NativeExecChannel
   sftpInit(): Promise<void>
   sftpReadFile(path: string): Promise<Buffer>
   sftpWriteFile(path: string, data: Buffer, mode?: number): Promise<void>
@@ -59,6 +61,17 @@ interface NativeSession {
   sftpUnlink(path: string): Promise<void>
   sftpMkdir(path: string, mode?: number): Promise<void>
   end(): void
+}
+
+interface NativeExecChannel {
+  start(
+    onData: (chunk: Buffer) => void,
+    onStderr: (chunk: Buffer) => void,
+    onClose: (info: { code: number; aborted: boolean; error?: string }) => void,
+  ): void
+  abort(): void
+  writeStdin(buf: Buffer): void
+  endStdin(): void
 }
 
 export interface ConnectConfig {
@@ -131,21 +144,9 @@ export class Client extends EventEmitter {
       queueMicrotask(() => callback(new Error('Not connected')))
       return false
     }
-    const sess = this.session
-    const stream = new ExecStream()
-    sess.exec(command, stream._stdinPending).then(result => {
-      // Push collected output then close. ssh2 streams emit 'data' and
-      // 'close' separately for stdout/stderr — we mirror that.
-      if (result.stdout.length > 0) stream.push(result.stdout)
-      stream.push(null)
-      if (result.stderr.length > 0) stream.stderr.push(result.stderr)
-      stream.stderr.push(null)
-      stream.emit('exit', result.code, null)
-      stream.emit('close', result.code, null)
-    }).catch(err => {
-      stream.destroy(err instanceof Error ? err : new Error(String(err)))
-      stream.stderr.destroy(err instanceof Error ? err : new Error(String(err)))
-    })
+    const native_channel = this.session.execStream(command)
+    const stream = new ExecStream(native_channel)
+    stream._wireUp()
     queueMicrotask(() => callback(null, stream))
     return true
   }
@@ -178,42 +179,87 @@ export class Client extends EventEmitter {
 }
 
 /**
- * Exec channel — ssh2-shaped. The native binding currently delivers the
- * full stdout/stderr in one shot; we surface that through Readable's data
- * events so consumers that listen for 'data' / 'close' work unchanged.
+ * Exec channel — ssh2-shaped. Backed by the native `SshExecChannel`,
+ * which runs the libssh read loop on its own thread and pushes chunks
+ * into JS via TSFN callbacks. Stdout chunks land on the stream's
+ * built-in Readable; stderr chunks land on `stream.stderr`. The final
+ * `'close'` event fires with the remote exit code (and `'exit'` for
+ * ssh2 compatibility).
  *
- * Future: switch the native binding to streaming reads and forward chunks
- * here as they arrive. The JS API is already streaming-shaped.
+ * `signal('TERM')` and `close()` both call `abort()` on the native
+ * channel — the worker thread sends SIGTERM to the remote process at
+ * its next 100ms poll boundary and closes the channel.
  */
 export class ExecStream extends Readable {
   stderr: Readable
-  /** Bytes queued by callers before exec() actually runs (rare). */
-  _stdinPending?: Buffer
+  private native_channel: NativeExecChannel
+  private aborted = false
 
-  /** Stub stdin. Writes are buffered and delivered as part of the exec
-   *  request. Only useful when called synchronously after .exec(). */
+  /** Pre-start stdin pending. Used only if writes happen before the
+   *  channel has been wired up (matches ssh2's order-tolerant shape). */
+  _stdinPending?: Buffer
   stdin = {
     write: (chunk: string | Buffer): boolean => {
       const buf = typeof chunk === 'string' ? Buffer.from(chunk, 'utf-8') : chunk
-      this._stdinPending = this._stdinPending ? Buffer.concat([this._stdinPending, buf]) : buf
+      if (this._wired) this.native_channel.writeStdin(buf)
+      else this._stdinPending = this._stdinPending ? Buffer.concat([this._stdinPending, buf]) : buf
       return true
     },
     end: (chunk?: string | Buffer): void => {
-      if (chunk) this.stdin.write(chunk)
+      if (chunk !== undefined) this.stdin.write(chunk)
+      if (this._wired) this.native_channel.endStdin()
     },
     on: (_e: string, _cb: () => void) => this.stdin,
   }
 
-  constructor() {
-    super()
-    this.stderr = new Readable({ read() {} })
-  }
-  _read(): void { /* no-op: data is push()'d when exec resolves */ }
+  private _wired = false
 
-  /** ssh2 exposes this on the channel. We send a remote signal via... well,
-   *  not yet. Punt: just close the channel. */
-  signal(_sig: string): void { /* TODO: implement via libssh ssh_channel_request_send_signal */ }
-  close(): void { this.destroy() }
+  constructor(native_channel: NativeExecChannel) {
+    // emitClose:false — we emit our own 'close' with (code, signal) so it
+    // doesn't fight with Readable's automatic argless close on push(null).
+    super({ emitClose: false, autoDestroy: false })
+    this.stderr = new Readable({ read() {}, emitClose: false, autoDestroy: false })
+    this.native_channel = native_channel
+  }
+
+  /** Called by Client.exec right after construction — registers TSFN
+   *  callbacks and starts the worker. */
+  _wireUp(): void {
+    if (this._wired) return
+    this._wired = true
+    this.native_channel.start(
+      (chunk: Buffer) => { this.push(chunk) },
+      (chunk: Buffer) => { this.stderr.push(chunk) },
+      (info: { code: number; aborted: boolean; error?: string }) => {
+        this.push(null)
+        this.stderr.push(null)
+        if (info.error) this.emit('error', new Error(info.error))
+        this.emit('exit', info.code, info.aborted ? 'TERM' : null)
+        this.emit('close', info.code, info.aborted ? 'TERM' : null)
+      },
+    )
+    if (this._stdinPending) {
+      this.native_channel.writeStdin(this._stdinPending)
+      this._stdinPending = undefined
+    }
+  }
+
+  _read(): void { /* no-op: data is push()'d by TSFN callbacks */ }
+
+  /** ssh2's exec channel exposes `.signal(name)` for SIGTERM/SIGKILL/etc.
+   *  We translate any signal to channel-abort, which sends 'TERM' to the
+   *  remote process and closes the channel. */
+  signal(_sig: string): void {
+    if (this.aborted) return
+    this.aborted = true
+    try { this.native_channel.abort() } catch { /* ignore */ }
+  }
+
+  close(): void {
+    if (this.aborted) return
+    this.aborted = true
+    try { this.native_channel.abort() } catch { /* ignore */ }
+  }
 }
 
 /**

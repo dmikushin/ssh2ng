@@ -18,9 +18,12 @@ extern "C" {
 }
 
 #include <fcntl.h>
+#include <atomic>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -40,6 +43,7 @@ public:
 private:
   Napi::Value Connect(const Napi::CallbackInfo& info);
   Napi::Value Exec(const Napi::CallbackInfo& info);
+  Napi::Value ExecStream(const Napi::CallbackInfo& info);
   Napi::Value SftpInit(const Napi::CallbackInfo& info);
   Napi::Value SftpReadFile(const Napi::CallbackInfo& info);
   Napi::Value SftpWriteFile(const Napi::CallbackInfo& info);
@@ -413,12 +417,261 @@ private:
   bool is_dir_ = false, is_reg_ = false;
 };
 
+// ---- SshExecChannel ---------------------------------------------------------
+//
+// Streaming exec channel: spawns a worker thread that drives the channel
+// reads, pushes stdout/stderr chunks into JS via ThreadSafeFunctions, and
+// reports the final exit code. Honors abort() from JS at the next 100ms
+// poll boundary by sending SIGTERM through the SSH signal channel and
+// closing the channel.
+//
+// Lifecycle:
+//   const ch = new SshExecChannel(session, command, stdin?)
+//   ch.start(onData, onStderr, onClose)
+//   ch.abort()             // optional
+// JS holds the only strong reference; when GC'd, the destructor signals
+// the worker, joins it, and releases the TSFNs.
+
+class SshExecChannel : public Napi::ObjectWrap<SshExecChannel> {
+public:
+  static Napi::Function GetClass(Napi::Env env);
+  SshExecChannel(const Napi::CallbackInfo& info);
+  ~SshExecChannel();
+
+private:
+  Napi::Value Start(const Napi::CallbackInfo& info);
+  Napi::Value Abort(const Napi::CallbackInfo& info);
+  Napi::Value WriteStdin(const Napi::CallbackInfo& info);
+  Napi::Value EndStdin(const Napi::CallbackInfo& info);
+
+  void Run();
+
+  // Owning reference. Stored as a Napi::ObjectReference so the parent
+  // session JS object can't be GC'd while the worker thread is running.
+  Napi::ObjectReference session_ref_;
+  SshSession* sess_ = nullptr;
+  std::string command_;
+  std::vector<uint8_t> initial_stdin_;
+  bool has_initial_stdin_ = false;
+
+  std::thread thread_;
+  std::atomic<bool> aborted_{false};
+  std::atomic<bool> stdin_closed_{false};
+  std::atomic<bool> running_{false};
+
+  // Pending stdin writes (from JS). Worker drains and forwards to remote.
+  std::mutex stdin_mu_;
+  std::vector<uint8_t> stdin_pending_;
+
+  Napi::ThreadSafeFunction tsfn_data_;
+  Napi::ThreadSafeFunction tsfn_stderr_;
+  Napi::ThreadSafeFunction tsfn_close_;
+};
+
+Napi::Function SshExecChannel::GetClass(Napi::Env env) {
+  return DefineClass(env, "SshExecChannel", {
+    InstanceMethod("start", &SshExecChannel::Start),
+    InstanceMethod("abort", &SshExecChannel::Abort),
+    InstanceMethod("writeStdin", &SshExecChannel::WriteStdin),
+    InstanceMethod("endStdin", &SshExecChannel::EndStdin),
+  });
+}
+
+SshExecChannel::SshExecChannel(const Napi::CallbackInfo& info)
+  : Napi::ObjectWrap<SshExecChannel>(info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsString()) {
+    Napi::Error::New(env, "SshExecChannel(session, command, stdin?)").ThrowAsJavaScriptException();
+    return;
+  }
+  Napi::Object sess_obj = info[0].As<Napi::Object>();
+  sess_ = Napi::ObjectWrap<SshSession>::Unwrap(sess_obj);
+  session_ref_ = Napi::Persistent(sess_obj);
+  command_ = info[1].As<Napi::String>().Utf8Value();
+  if (info.Length() > 2 && info[2].IsBuffer()) {
+    auto buf = info[2].As<Napi::Buffer<uint8_t>>();
+    initial_stdin_.assign(buf.Data(), buf.Data() + buf.Length());
+    has_initial_stdin_ = true;
+  }
+}
+
+SshExecChannel::~SshExecChannel() {
+  aborted_ = true;
+  stdin_closed_ = true;
+  if (thread_.joinable()) thread_.join();
+  // TSFNs are released inside Run() when the worker finishes; if start
+  // was never called they're empty and Release is a no-op.
+}
+
+Napi::Value SshExecChannel::Start(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (running_.exchange(true)) {
+    Napi::Error::New(env, "SshExecChannel already started").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 3 || !info[0].IsFunction() || !info[1].IsFunction() || !info[2].IsFunction()) {
+    Napi::Error::New(env, "start(onData, onStderr, onClose)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  tsfn_data_ = Napi::ThreadSafeFunction::New(env, info[0].As<Napi::Function>(), "ssh2ng_exec_data", 0, 1);
+  tsfn_stderr_ = Napi::ThreadSafeFunction::New(env, info[1].As<Napi::Function>(), "ssh2ng_exec_stderr", 0, 1);
+  tsfn_close_ = Napi::ThreadSafeFunction::New(env, info[2].As<Napi::Function>(), "ssh2ng_exec_close", 0, 1);
+
+  thread_ = std::thread([this]() { this->Run(); });
+  return env.Undefined();
+}
+
+Napi::Value SshExecChannel::Abort(const Napi::CallbackInfo& info) {
+  aborted_ = true;
+  return info.Env().Undefined();
+}
+
+Napi::Value SshExecChannel::WriteStdin(const Napi::CallbackInfo& info) {
+  if (!info[0].IsBuffer()) {
+    Napi::Error::New(info.Env(), "writeStdin(buffer)").ThrowAsJavaScriptException();
+    return info.Env().Undefined();
+  }
+  auto buf = info[0].As<Napi::Buffer<uint8_t>>();
+  std::lock_guard<std::mutex> lock(stdin_mu_);
+  stdin_pending_.insert(stdin_pending_.end(), buf.Data(), buf.Data() + buf.Length());
+  return info.Env().Undefined();
+}
+
+Napi::Value SshExecChannel::EndStdin(const Napi::CallbackInfo& info) {
+  stdin_closed_ = true;
+  return info.Env().Undefined();
+}
+
+namespace {
+// Helper: forward a buffer slice to a JS callback via a TSFN.
+void post_chunk(Napi::ThreadSafeFunction& tsfn, const uint8_t* data, size_t len) {
+  if (len == 0) return;
+  // Copy into a heap vector; freed in the JS-thread callback.
+  auto* owned = new std::vector<uint8_t>(data, data + len);
+  napi_status st = tsfn.NonBlockingCall(owned, [](Napi::Env env, Napi::Function jsCb, std::vector<uint8_t>* d) {
+    if (!d) return;
+    auto buf = Napi::Buffer<uint8_t>::Copy(env, d->data(), d->size());
+    delete d;
+    jsCb.Call({ buf });
+  });
+  if (st != napi_ok) delete owned;
+}
+} // anon
+
+void SshExecChannel::Run() {
+  ssh_session s = sess_->session_;
+  ssh_channel ch = ssh_channel_new(s);
+
+  int exit_status = -1;
+  std::string fail;
+
+  if (!ch) {
+    fail = "channel_new failed";
+  } else if (ssh_channel_open_session(ch) != SSH_OK) {
+    fail = std::string("channel_open_session: ") + ssh_get_error(s);
+    ssh_channel_free(ch);
+    ch = nullptr;
+  } else if (ssh_channel_request_exec(ch, command_.c_str()) != SSH_OK) {
+    fail = std::string("channel_request_exec: ") + ssh_get_error(s);
+    ssh_channel_close(ch);
+    ssh_channel_free(ch);
+    ch = nullptr;
+  }
+
+  if (ch) {
+    // Send any stdin queued before start().
+    if (has_initial_stdin_ && !initial_stdin_.empty()) {
+      size_t total = 0;
+      while (total < initial_stdin_.size()) {
+        int wrote = ssh_channel_write(ch, initial_stdin_.data() + total,
+                                      static_cast<uint32_t>(initial_stdin_.size() - total));
+        if (wrote == SSH_ERROR) { fail = ssh_get_error(s); break; }
+        total += static_cast<size_t>(wrote);
+      }
+    }
+
+    char buf[16384];
+
+    while (!aborted_.load() && !ssh_channel_is_eof(ch)) {
+      // Drain any stdin queued from JS while we run.
+      {
+        std::vector<uint8_t> pending;
+        {
+          std::lock_guard<std::mutex> lock(stdin_mu_);
+          pending.swap(stdin_pending_);
+        }
+        if (!pending.empty()) {
+          size_t total = 0;
+          while (total < pending.size()) {
+            int wrote = ssh_channel_write(ch, pending.data() + total,
+                                          static_cast<uint32_t>(pending.size() - total));
+            if (wrote == SSH_ERROR) { fail = ssh_get_error(s); break; }
+            total += static_cast<size_t>(wrote);
+          }
+        }
+      }
+      if (stdin_closed_.load()) {
+        ssh_channel_send_eof(ch);
+        // After EOF we don't have more to write; flag stays set.
+        stdin_closed_ = true;
+      }
+
+      // Wait up to 100ms for stdout. Short timeout keeps us responsive
+      // to abort() and to incoming stdin writes.
+      int n = ssh_channel_read_timeout(ch, buf, sizeof(buf), 0, 100);
+      if (n > 0) post_chunk(tsfn_data_, reinterpret_cast<uint8_t*>(buf), n);
+      else if (n == SSH_ERROR) { fail = ssh_get_error(s); break; }
+      // n == 0 → EOF on stdout; loop will check is_eof().
+      // n == SSH_AGAIN → no data this tick; fall through.
+
+      // Drain stderr non-blockingly so it interleaves naturally.
+      int m = ssh_channel_read_nonblocking(ch, buf, sizeof(buf), 1);
+      if (m > 0) post_chunk(tsfn_stderr_, reinterpret_cast<uint8_t*>(buf), m);
+      else if (m == SSH_ERROR && fail.empty()) fail = ssh_get_error(s);
+    }
+
+    // Final stderr drain.
+    int m;
+    while ((m = ssh_channel_read_nonblocking(ch, buf, sizeof(buf), 1)) > 0) {
+      post_chunk(tsfn_stderr_, reinterpret_cast<uint8_t*>(buf), m);
+    }
+
+    if (aborted_.load()) {
+      // Best-effort SIGTERM to the remote process.
+      ssh_channel_request_send_signal(ch, "TERM");
+    }
+
+    exit_status = ssh_channel_get_exit_status(ch);
+    if (!stdin_closed_.load()) ssh_channel_send_eof(ch);
+    ssh_channel_close(ch);
+    ssh_channel_free(ch);
+  }
+
+  // Tell JS we're done.
+  struct CloseArgs { int code; bool aborted; std::string error; };
+  auto* args = new CloseArgs{ exit_status, aborted_.load(), std::move(fail) };
+  napi_status st = tsfn_close_.NonBlockingCall(args, [](Napi::Env env, Napi::Function jsCb, CloseArgs* a) {
+    Napi::Object o = Napi::Object::New(env);
+    o.Set("code", Napi::Number::New(env, a->code));
+    o.Set("aborted", Napi::Boolean::New(env, a->aborted));
+    if (!a->error.empty()) o.Set("error", Napi::String::New(env, a->error));
+    delete a;
+    jsCb.Call({ o });
+  });
+  if (st != napi_ok) delete args;
+
+  tsfn_data_.Release();
+  tsfn_stderr_.Release();
+  tsfn_close_.Release();
+}
+
 // ---- SshSession bindings ----------------------------------------------------
 
 Napi::Function SshSession::GetClass(Napi::Env env) {
   return DefineClass(env, "SshSession", {
     InstanceMethod("connect", &SshSession::Connect),
     InstanceMethod("exec", &SshSession::Exec),
+    InstanceMethod("execStream", &SshSession::ExecStream),
     InstanceMethod("sftpInit", &SshSession::SftpInit),
     InstanceMethod("sftpReadFile", &SshSession::SftpReadFile),
     InstanceMethod("sftpWriteFile", &SshSession::SftpWriteFile),
@@ -476,6 +729,19 @@ Napi::Value SshSession::Exec(const Napi::CallbackInfo& info) {
   Napi::Promise p = w->GetPromise();
   w->Queue();
   return p;
+}
+
+// Streaming variant. Constructs an `SshExecChannel` JS instance bound to
+// this session — the caller then registers stdout/stderr/close TSFNs via
+// `.start()`. See SshExecChannel for the full lifecycle.
+Napi::Value SshSession::ExecStream(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Function ctor = SshExecChannel::GetClass(env);
+  std::vector<napi_value> args;
+  args.push_back(this->Value());           // session
+  args.push_back(info[0]);                 // command
+  if (info.Length() > 1) args.push_back(info[1]); // stdin (optional)
+  return ctor.New(args);
 }
 
 Napi::Value SshSession::SftpInit(const Napi::CallbackInfo& info) {
@@ -552,6 +818,7 @@ Napi::Value SshSession::End(const Napi::CallbackInfo& info) {
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("SshSession", SshSession::GetClass(env));
+  exports.Set("SshExecChannel", SshExecChannel::GetClass(env));
   return exports;
 }
 
