@@ -28,11 +28,25 @@ platforms are still pending.
 
 ## Install (current state)
 
+`ssh2ng` ships libssh statically inside the native addon — the resulting
+`ssh2ng.node` only depends on libraries every distro has (libcrypto, libz,
+libc, libstdc++). No `libssh-dev` package needed at install or runtime.
+
 ```sh
-# Build dependency: libssh ≥ 0.10 with headers (libssh-dev / libssh-devel /
-# brew install libssh / pacman -S libssh).
-bun add file:/path/to/ssh2ng
+# Build prerequisites: cmake, a C/C++ toolchain, OpenSSL dev headers (for
+# linking against libcrypto). On Debian/Ubuntu: build-essential cmake
+# libssl-dev. On macOS: brew install cmake openssl.
+git clone --recurse-submodules <ssh2ng-repo>
+bun install        # builds libssh.a, then the native addon
 ```
+
+Once the package is published to npm with prebuilds, consumers will just do:
+
+```sh
+bun add ssh2ng
+```
+
+with no compilation step.
 
 ## Usage
 
