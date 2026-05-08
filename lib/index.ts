@@ -47,6 +47,7 @@ function findNativeAddon(): string {
 const native = require(findNativeAddon()) as {
   SshSession: new () => NativeSession
   SshExecChannel: new (session: NativeSession, command: string, stdin?: Buffer) => NativeExecChannel
+  SshSftpReadStream: new (session: NativeSession, path: string, offset?: number, length?: number) => NativeSftpReadStream
 }
 
 interface NativeSession {
@@ -55,6 +56,7 @@ interface NativeSession {
   execStream(cmd: string, stdin?: Buffer): NativeExecChannel
   sftpInit(): Promise<void>
   sftpReadFile(path: string): Promise<Buffer>
+  sftpReadStream(path: string, offset?: number, length?: number): NativeSftpReadStream
   sftpWriteFile(path: string, data: Buffer, mode?: number): Promise<void>
   sftpStat(path: string): Promise<{ size: number; mtime: number; isDirectory: boolean; isFile: boolean }>
   sftpRename(oldPath: string, newPath: string): Promise<void>
@@ -72,6 +74,14 @@ interface NativeExecChannel {
   abort(): void
   writeStdin(buf: Buffer): void
   endStdin(): void
+}
+
+interface NativeSftpReadStream {
+  start(
+    onData: (chunk: Buffer) => void,
+    onClose: (info: { bytes: number; aborted: boolean; error?: string }) => void,
+  ): void
+  abort(): void
 }
 
 export interface ConnectConfig {
@@ -312,23 +322,36 @@ export class SFTPWrapper extends EventEmitter {
   }
 
   /**
-   * createReadStream — ssh2-compatible streaming Read. Currently delegates
-   * to readFile under the hood; range support and true streaming will be
-   * added when the binding gets sftp_open / sftp_read with offsets.
+   * createReadStream — ssh2-compatible streaming read. Backed by the native
+   * `SshSftpReadStream`, which streams 32 KB chunks via TSFN as they arrive
+   * from the remote — no full-file buffering. Supports `start` / `end`
+   * (inclusive byte offsets) and an `encoding` for string decoding.
    */
   createReadStream(path: string, opts?: { start?: number; end?: number; encoding?: BufferEncoding }): Readable {
-    const r = new Readable({ read() {} })
-    this.session.sftpReadFile(path).then(buf => {
-      let view: Buffer = buf
-      if (opts?.start !== undefined || opts?.end !== undefined) {
-        const start = opts?.start ?? 0
-        const end = opts?.end !== undefined ? Math.min(opts.end + 1, buf.length) : buf.length
-        view = buf.subarray(start, end)
-      }
-      if (opts?.encoding) r.push(view.toString(opts.encoding))
-      else r.push(view)
-      r.push(null)
-    }).catch(err => r.destroy(err instanceof Error ? err : new Error(String(err))))
+    const r = new Readable({ read() {}, emitClose: false, autoDestroy: false })
+    const start = opts?.start ?? 0
+    const length = opts?.end !== undefined ? Math.max(0, opts.end - start + 1) : 0  // 0 → until EOF
+    const native_stream = this.session.sftpReadStream(path, start, length)
+    let aborted = false
+
+    const r_with_destroy = r as Readable & { destroy(err?: Error): void }
+    const orig_destroy = r_with_destroy.destroy.bind(r_with_destroy)
+    r_with_destroy.destroy = (err?: Error) => {
+      if (!aborted) { aborted = true; try { native_stream.abort() } catch { /* ignore */ } }
+      return orig_destroy(err)
+    }
+
+    native_stream.start(
+      (chunk: Buffer) => {
+        if (opts?.encoding) r.push(chunk.toString(opts.encoding))
+        else r.push(chunk)
+      },
+      (info: { bytes: number; aborted: boolean; error?: string }) => {
+        r.push(null)
+        if (info.error) r.emit('error', new Error(info.error))
+        r.emit('close')
+      },
+    )
     return r
   }
 

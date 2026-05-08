@@ -46,6 +46,7 @@ private:
   Napi::Value ExecStream(const Napi::CallbackInfo& info);
   Napi::Value SftpInit(const Napi::CallbackInfo& info);
   Napi::Value SftpReadFile(const Napi::CallbackInfo& info);
+  Napi::Value SftpReadStream(const Napi::CallbackInfo& info);
   Napi::Value SftpWriteFile(const Napi::CallbackInfo& info);
   Napi::Value SftpStat(const Napi::CallbackInfo& info);
   Napi::Value SftpRename(const Napi::CallbackInfo& info);
@@ -665,6 +666,170 @@ void SshExecChannel::Run() {
   tsfn_close_.Release();
 }
 
+// ---- SshSftpReadStream ------------------------------------------------------
+//
+// Streaming SFTP read. Spawns a worker thread that opens the remote file,
+// optionally seeks to a byte offset, and reads up to N bytes (or until EOF)
+// in 32 KB chunks. Each chunk is posted to JS via a TSFN so a JS Readable
+// can `push()` it as it arrives — no full-file buffering on the C++ side.
+//
+// Each instance gets its own `sftp_session` so concurrent reads don't
+// race. The `ssh_session` is shared but libssh's sftp protocol channels
+// are independent.
+//
+// Lifecycle:
+//   const r = new SshSftpReadStream(session, path, startBytes, lengthBytes)
+//   r.start(onData, onClose)
+//   r.abort()  // optional
+
+class SshSftpReadStream : public Napi::ObjectWrap<SshSftpReadStream> {
+public:
+  static Napi::Function GetClass(Napi::Env env);
+  SshSftpReadStream(const Napi::CallbackInfo& info);
+  ~SshSftpReadStream();
+
+private:
+  Napi::Value Start(const Napi::CallbackInfo& info);
+  Napi::Value Abort(const Napi::CallbackInfo& info);
+  void Run();
+
+  Napi::ObjectReference session_ref_;
+  SshSession* sess_ = nullptr;
+  std::string path_;
+  uint64_t offset_ = 0;
+  uint64_t length_ = 0;        // 0 = until EOF
+
+  std::thread thread_;
+  std::atomic<bool> aborted_{false};
+  std::atomic<bool> running_{false};
+
+  Napi::ThreadSafeFunction tsfn_data_;
+  Napi::ThreadSafeFunction tsfn_close_;
+};
+
+Napi::Function SshSftpReadStream::GetClass(Napi::Env env) {
+  return DefineClass(env, "SshSftpReadStream", {
+    InstanceMethod("start", &SshSftpReadStream::Start),
+    InstanceMethod("abort", &SshSftpReadStream::Abort),
+  });
+}
+
+SshSftpReadStream::SshSftpReadStream(const Napi::CallbackInfo& info)
+  : Napi::ObjectWrap<SshSftpReadStream>(info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsString()) {
+    Napi::Error::New(env, "SshSftpReadStream(session, path, offset?, length?)").ThrowAsJavaScriptException();
+    return;
+  }
+  Napi::Object sess_obj = info[0].As<Napi::Object>();
+  sess_ = Napi::ObjectWrap<SshSession>::Unwrap(sess_obj);
+  session_ref_ = Napi::Persistent(sess_obj);
+  path_ = info[1].As<Napi::String>().Utf8Value();
+  if (info.Length() > 2 && info[2].IsNumber()) {
+    double v = info[2].As<Napi::Number>().DoubleValue();
+    if (v > 0) offset_ = static_cast<uint64_t>(v);
+  }
+  if (info.Length() > 3 && info[3].IsNumber()) {
+    double v = info[3].As<Napi::Number>().DoubleValue();
+    if (v > 0) length_ = static_cast<uint64_t>(v);
+  }
+}
+
+SshSftpReadStream::~SshSftpReadStream() {
+  aborted_ = true;
+  if (thread_.joinable()) thread_.join();
+}
+
+Napi::Value SshSftpReadStream::Start(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (running_.exchange(true)) {
+    Napi::Error::New(env, "SshSftpReadStream already started").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 2 || !info[0].IsFunction() || !info[1].IsFunction()) {
+    Napi::Error::New(env, "start(onData, onClose)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  tsfn_data_ = Napi::ThreadSafeFunction::New(env, info[0].As<Napi::Function>(), "ssh2ng_sftpread_data", 0, 1);
+  tsfn_close_ = Napi::ThreadSafeFunction::New(env, info[1].As<Napi::Function>(), "ssh2ng_sftpread_close", 0, 1);
+
+  thread_ = std::thread([this]() { this->Run(); });
+  return env.Undefined();
+}
+
+Napi::Value SshSftpReadStream::Abort(const Napi::CallbackInfo& info) {
+  aborted_ = true;
+  return info.Env().Undefined();
+}
+
+void SshSftpReadStream::Run() {
+  ssh_session s = sess_->session_;
+  std::string fail;
+  uint64_t bytes_read = 0;
+
+  // Use the session-level sftp channel if it's already open; otherwise
+  // open a fresh one for this stream. We deliberately don't open many
+  // parallel sftp sessions because the ssh_session itself is single-
+  // threaded — JS callers serialize.
+  sftp_session sftp = sess_->sftp_;
+  bool owns_sftp = false;
+  if (!sftp) {
+    sftp = sftp_new(s);
+    if (sftp && sftp_init(sftp) == SSH_OK) {
+      owns_sftp = true;
+    } else {
+      if (sftp) { sftp_free(sftp); sftp = nullptr; }
+      fail = std::string("sftp_init: ") + ssh_get_error(s);
+    }
+  }
+
+  sftp_file f = nullptr;
+  if (sftp && fail.empty()) {
+    f = sftp_open(sftp, path_.c_str(), O_RDONLY, 0);
+    if (!f) fail = std::string("sftp_open: ") + ssh_get_error(s);
+    else if (offset_ > 0) {
+      if (sftp_seek64(f, offset_) != 0) {
+        fail = std::string("sftp_seek64: ") + ssh_get_error(s);
+      }
+    }
+  }
+
+  if (f && fail.empty()) {
+    char buf[32 * 1024];
+    while (!aborted_.load()) {
+      size_t want = sizeof(buf);
+      if (length_ > 0) {
+        uint64_t remaining = length_ - bytes_read;
+        if (remaining == 0) break;
+        if (remaining < want) want = static_cast<size_t>(remaining);
+      }
+      ssize_t n = sftp_read(f, buf, want);
+      if (n < 0) { fail = std::string("sftp_read: ") + ssh_get_error(s); break; }
+      if (n == 0) break;  // EOF
+      bytes_read += static_cast<uint64_t>(n);
+      post_chunk(tsfn_data_, reinterpret_cast<uint8_t*>(buf), static_cast<size_t>(n));
+    }
+  }
+
+  if (f) sftp_close(f);
+  if (owns_sftp) sftp_free(sftp);
+
+  struct CloseArgs { uint64_t bytes; bool aborted; std::string error; };
+  auto* args = new CloseArgs{ bytes_read, aborted_.load(), std::move(fail) };
+  napi_status st = tsfn_close_.NonBlockingCall(args, [](Napi::Env env, Napi::Function jsCb, CloseArgs* a) {
+    Napi::Object o = Napi::Object::New(env);
+    o.Set("bytes", Napi::Number::New(env, static_cast<double>(a->bytes)));
+    o.Set("aborted", Napi::Boolean::New(env, a->aborted));
+    if (!a->error.empty()) o.Set("error", Napi::String::New(env, a->error));
+    delete a;
+    jsCb.Call({ o });
+  });
+  if (st != napi_ok) delete args;
+
+  tsfn_data_.Release();
+  tsfn_close_.Release();
+}
+
 // ---- SshSession bindings ----------------------------------------------------
 
 Napi::Function SshSession::GetClass(Napi::Env env) {
@@ -674,6 +839,7 @@ Napi::Function SshSession::GetClass(Napi::Env env) {
     InstanceMethod("execStream", &SshSession::ExecStream),
     InstanceMethod("sftpInit", &SshSession::SftpInit),
     InstanceMethod("sftpReadFile", &SshSession::SftpReadFile),
+    InstanceMethod("sftpReadStream", &SshSession::SftpReadStream),
     InstanceMethod("sftpWriteFile", &SshSession::SftpWriteFile),
     InstanceMethod("sftpStat", &SshSession::SftpStat),
     InstanceMethod("sftpRename", &SshSession::SftpRename),
@@ -741,6 +907,19 @@ Napi::Value SshSession::ExecStream(const Napi::CallbackInfo& info) {
   args.push_back(this->Value());           // session
   args.push_back(info[0]);                 // command
   if (info.Length() > 1) args.push_back(info[1]); // stdin (optional)
+  return ctor.New(args);
+}
+
+// Construct an `SshSftpReadStream`. Args: path, [offsetBytes],
+// [lengthBytes]. See SshSftpReadStream for the lifecycle.
+Napi::Value SshSession::SftpReadStream(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Function ctor = SshSftpReadStream::GetClass(env);
+  std::vector<napi_value> args;
+  args.push_back(this->Value());           // session
+  args.push_back(info[0]);                 // path
+  if (info.Length() > 1) args.push_back(info[1]); // offset
+  if (info.Length() > 2) args.push_back(info[2]); // length
   return ctor.New(args);
 }
 
@@ -819,6 +998,7 @@ Napi::Value SshSession::End(const Napi::CallbackInfo& info) {
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("SshSession", SshSession::GetClass(env));
   exports.Set("SshExecChannel", SshExecChannel::GetClass(env));
+  exports.Set("SshSftpReadStream", SshSftpReadStream::GetClass(env));
   return exports;
 }
 
