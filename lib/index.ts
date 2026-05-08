@@ -10,35 +10,45 @@ import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import { createRequire } from 'node:module'
 import { existsSync } from 'node:fs'
-
-const require = createRequire(import.meta.url)
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+
+const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
+
+// Bun-specific: this `import ... with { type: 'file' }` asks the bundler
+// to embed the .node addon directly into the consumer's compiled binary
+// (e.g. `bun build --compile`). At runtime Bun extracts it to a temp dir
+// and gives us the path. In `bun run` (dev / interpreted) the path is
+// just the on-disk location of the file. Either way `nativeAddonAsset`
+// resolves to a require()-able path.
+//
+// On Node (no import attributes for binary files) the line below would
+// throw at parse time — but ssh2ng is Bun-first by design.
+// @ts-expect-error — `with` attribute on a non-JSON import is Bun-specific
+import nativeAddonAsset from '../build/Release/ssh2ng.node' with { type: 'file' }
 
 /**
  * Locate `ssh2ng.node`. Search order:
- *   1) Next to this JS file (normal `node_modules/ssh2ng/build/Release/ssh2ng.node`)
- *   2) Next to the running executable (Bun --compile output ships the
- *      .node file alongside the binary).
- *   3) `SSH2NG_NATIVE_ADDON` env var override (for tests / packagers).
- *
- * Bun's `--compile` does not bundle `.node` files — they have to travel
- * with the binary. Path #2 covers that case so consumers who ship a
- * compiled CLI can drop the .node next to it.
+ *   1) The path produced by Bun's embedded-asset import (covers
+ *      \`bun run\` AND \`bun build --compile\` — the asset is extracted
+ *      to a tempdir on first run).
+ *   2) `SSH2NG_NATIVE_ADDON` env var override (tests / packagers).
+ *   3) Conventional locations next to this JS file or the executable
+ *      (defensive fallback for unusual builds).
  */
 function findNativeAddon(): string {
+  if (nativeAddonAsset && existsSync(nativeAddonAsset)) return nativeAddonAsset
   const override = process.env.SSH2NG_NATIVE_ADDON
   if (override && existsSync(override)) return override
-
   const candidates = [
     resolve(__dirname, '..', 'build', 'Release', 'ssh2ng.node'),
     resolve(dirname(process.execPath), 'ssh2ng.node'),
-    resolve(dirname(process.execPath), 'lib', 'ssh2ng.node'),
   ]
   for (const c of candidates) if (existsSync(c)) return c
   throw new Error(
-    `ssh2ng: could not find native addon. Looked in:\n` +
+    `ssh2ng: could not find native addon. Tried:\n` +
+    `  - embedded asset: ${nativeAddonAsset || '(none)'}\n` +
     candidates.map(c => `  - ${c}`).join('\n') +
     `\nSet SSH2NG_NATIVE_ADDON to override.`,
   )

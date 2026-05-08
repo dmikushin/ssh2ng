@@ -2,7 +2,7 @@
   "name": "ssh2ng",
   "version": "0.0.1",
   "description": "ssh2-compatible API on top of libssh — drop-in replacement that honors ~/.ssh/config (ProxyJump, ProxyCommand, IdentityFile, agent, certificates).",
-  "main": "lib/index.js",
+  "main": "lib/index.ts",
   "types": "lib/index.d.ts",
   "files": [
     "lib/",
