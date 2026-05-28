@@ -1,3 +1,6 @@
 [submodule "vendor/libssh"]
 	path = vendor/libssh
 	url = https://gitlab.com/libssh/libssh-mirror.git
+[submodule "vendor/autossh"]
+	path = vendor/autossh
+	url = https://github.com/dmikushin/autossh-1.4g.git

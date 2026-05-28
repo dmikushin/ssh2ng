@@ -1,12 +1,15 @@
 {
   "name": "ssh2ng",
   "version": "0.0.1",
-  "description": "ssh2-compatible API on top of libssh — drop-in replacement that honors ~/.ssh/config (ProxyJump, ProxyCommand, IdentityFile, agent, certificates).",
+  "description": "ssh2-compatible API using libautossh/OpenSSH as supervised transport and libssh for exec/sftp.",
   "main": "lib/index.ts",
   "types": "lib/index.d.ts",
   "files": [
     "lib/",
     "src/",
+    "scripts/",
+    "vendor/autossh/",
+    "vendor/libssh/",
     "binding.gyp",
     "README.md"
   ],

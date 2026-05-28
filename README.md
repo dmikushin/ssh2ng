@@ -1,23 +1,25 @@
 # ssh2ng
 
-Drop-in replacement for [`ssh2`](https://www.npmjs.com/package/ssh2) on top
-of [libssh](https://www.libssh.org), so SSH client behavior in Node.js
-matches what you get from the system `ssh` binary — including the parts of
-`~/.ssh/config` that the JavaScript-only `ssh2` library never implemented.
+Drop-in replacement for [`ssh2`](https://www.npmjs.com/package/ssh2) using
+`libautossh` as the supervised transport and [libssh](https://www.libssh.org)
+for exec/SFTP on top of that transport.
 
 ## Why
 
-The `ssh2` npm package implements only the SSH protocol. It does not parse
-`~/.ssh/config`, doesn't honor `ProxyJump`, `ProxyCommand`, certificates,
-`Match` blocks, or hardware tokens. For real-world setups (corporate jump
-hosts, multi-hop bastions, pinned identities per host) this means every
-non-trivial connection silently fails.
+The `ssh2` npm package implements only the SSH protocol. It does not behave
+like the system OpenSSH client for real-world configs, and it cannot supervise
+the underlying TCP session the way autossh can.
 
-`ssh2ng` is the same `Client` / `SFTPWrapper` / `exec` API surface, but the
-underlying transport is libssh — the same library used by Cyberduck,
-Remmina, and Proxmox. libssh natively reads `~/.ssh/config` via
-`ssh_options_parse_config()`, so every host alias, ProxyJump, IdentityFile,
-and Match stanza in your config "just works".
+`ssh2ng` keeps the same `Client` / `SFTPWrapper` / `exec` API surface, but the
+default connection path is now:
+
+1. `libautossh` starts and supervises an OpenSSH local forward to the target.
+2. `libssh` connects to the returned local endpoint.
+3. exec and SFTP run through libssh over that supervised transport.
+
+This keeps OpenSSH responsible for `ProxyJump`, `ProxyCommand`, `Match`,
+hardware tokens, certificates, and ssh-config behavior, while autossh owns
+monitoring and restart of the fragile transport layer.
 
 ## Status
 
@@ -28,16 +30,17 @@ platforms are still pending.
 
 ## Install (current state)
 
-`ssh2ng` ships libssh statically inside the native addon — the resulting
-`ssh2ng.node` only depends on libraries every distro has (libcrypto, libz,
-libc, libstdc++). No `libssh-dev` package needed at install or runtime.
+`ssh2ng` ships libautossh and libssh statically inside the native addon. The
+resulting `ssh2ng.node` only depends on libraries every distro has
+(libcrypto, libz, libc, libstdc++). No `libssh-dev` package is needed at
+install or runtime.
 
 ```sh
-# Build prerequisites: cmake, a C/C++ toolchain, OpenSSL dev headers (for
-# linking against libcrypto). On Debian/Ubuntu: build-essential cmake
-# libssl-dev. On macOS: brew install cmake openssl.
+# Build prerequisites: cmake, cargo/rustc, a C/C++ toolchain, OpenSSL dev
+# headers. On Debian/Ubuntu: build-essential cmake cargo libssl-dev.
+# On macOS: brew install cmake rust openssl.
 git clone --recurse-submodules <ssh2ng-repo>
-bun install        # builds libssh.a, then the native addon
+bun install        # builds libautossh.a, libssh.a, then the native addon
 ```
 
 Once the package is published to npm with prebuilds, consumers will just do:
@@ -66,18 +69,20 @@ client.once('ready', () => {
   })
 })
 client.once('error', err => console.error(err))
-client.connect({ host: 'pi' })   // resolves through ~/.ssh/config
+client.connect({ host: 'pi' })   // OpenSSH/autossh transport by default
 ```
 
-`client.connect()` reads:
+By default, `client.connect()` starts a supervised autossh transport. Useful
+transport options:
 
-- `Host`, `HostName`, `User`, `Port` — for the alias
-- `IdentityFile` chain (or the agent if `SSH_AUTH_SOCK` is set)
-- `ProxyJump`, `ProxyCommand`
-- `CertificateFile`
-- `Match` blocks
-
-…by delegating to libssh, which is the canonical implementation.
+- `useAutossh: false` disables the supervised transport and uses direct libssh.
+- `autosshDestination` overrides the OpenSSH destination. Defaults to `host`.
+- `autosshTargetHost` / `autosshTargetPort` set the remote endpoint forwarded
+  back to libssh. Defaults to `127.0.0.1:<port || 22>`.
+- `autosshBindHost` controls the local bind address consumed by libssh.
+- `autosshMonitorHost` / `autosshMonitorPort` control autossh monitoring.
+- `autosshDisableMonitor: true` is equivalent to `autossh -M 0`.
+- `autosshExtraArgs` passes extra arguments to the OpenSSH process.
 
 ## What's *not* drop-in vs `ssh2`
 

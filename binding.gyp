@@ -7,14 +7,18 @@
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")",
-        "vendor/install/include"
+        "vendor/install/include",
+        "vendor/autossh/include"
       ],
       "libraries": [
+        "<(module_root_dir)/vendor/autossh/target/release/libautossh.a",
         "<(module_root_dir)/vendor/install/lib/libssh.a",
         "-lssl",
         "-lcrypto",
         "-lz",
-        "-lpthread"
+        "-lpthread",
+        "-ldl",
+        "-lm"
       ],
       "cflags": [
         "-fexceptions"
@@ -28,6 +32,13 @@
         "NAPI_VERSION=8"
       ],
       "actions": [
+        {
+          "action_name": "build_autossh_static",
+          "inputs": [ "scripts/build-autossh.sh" ],
+          "outputs": [ "vendor/autossh/target/release/libautossh.a" ],
+          "action": [ "bash", "scripts/build-autossh.sh" ],
+          "message": "Building static autossh from vendor/autossh"
+        },
         {
           "action_name": "build_libssh_static",
           "inputs": [ "scripts/build-libssh.sh" ],

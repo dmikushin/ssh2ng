@@ -13,6 +13,7 @@
 #include <napi.h>
 
 extern "C" {
+#include <autossh.h>
 #include <libssh/libssh.h>
 #include <libssh/sftp.h>
 }
@@ -39,6 +40,9 @@ public:
 
   ssh_session session_ = nullptr;
   sftp_session sftp_ = nullptr;
+  autossh_session* autossh_ = nullptr;
+
+  void StopAutossh();
 
 private:
   Napi::Value Connect(const Napi::CallbackInfo& info);
@@ -61,16 +65,34 @@ class ConnectWorker : public Napi::AsyncWorker {
 public:
   ConnectWorker(Napi::Env env, SshSession* sess,
                 std::string host, std::string user, int port,
-                int timeoutSec, bool acceptAnyHostKey)
+                int timeoutSec, bool acceptAnyHostKey,
+                bool useAutossh, std::string autosshDestination,
+                std::string autosshTargetHost, int autosshTargetPort,
+                std::string autosshBindHost, std::string autosshMonitorHost,
+                int autosshMonitorPort, bool autosshDisableMonitor,
+                std::vector<std::string> autosshExtraArgs)
     : Napi::AsyncWorker(env),
       deferred_(Napi::Promise::Deferred::New(env)),
       sess_(sess), host_(std::move(host)), user_(std::move(user)),
-      port_(port), timeout_(timeoutSec), acceptAnyHostKey_(acceptAnyHostKey) {}
+      port_(port), timeout_(timeoutSec), acceptAnyHostKey_(acceptAnyHostKey),
+      useAutossh_(useAutossh),
+      autosshDestination_(std::move(autosshDestination)),
+      autosshTargetHost_(std::move(autosshTargetHost)),
+      autosshTargetPort_(autosshTargetPort),
+      autosshBindHost_(std::move(autosshBindHost)),
+      autosshMonitorHost_(std::move(autosshMonitorHost)),
+      autosshMonitorPort_(autosshMonitorPort),
+      autosshDisableMonitor_(autosshDisableMonitor),
+      autosshExtraArgs_(std::move(autosshExtraArgs)) {}
 
   Napi::Promise GetPromise() { return deferred_.Promise(); }
 
   void Execute() override {
     ssh_session s = sess_->session_;
+    if (!s) {
+      err_ = "session already closed";
+      return;
+    }
 
     if (ssh_options_set(s, SSH_OPTIONS_HOST, host_.c_str()) != SSH_OK) {
       err_ = std::string("set host failed: ") + ssh_get_error(s);
@@ -92,22 +114,98 @@ public:
       return;
     }
 
-    if (!user_.empty()) {
-      if (ssh_options_set(s, SSH_OPTIONS_USER, user_.c_str()) != SSH_OK) {
-        err_ = std::string("set user failed: ") + ssh_get_error(s);
+    unsigned int parsedPort = 0;
+    ssh_options_get_port(s, &parsedPort);
+
+    std::string connectHost = host_;
+    int connectPort = port_ > 0 ? port_ : static_cast<int>(parsedPort);
+
+    if (useAutossh_) {
+      autossh_session_config cfg;
+      autossh_session_config_init(&cfg);
+
+      std::string destination = autosshDestination_.empty() ? host_ : autosshDestination_;
+      std::string targetHost = autosshTargetHost_.empty() ? "127.0.0.1" : autosshTargetHost_;
+      std::string bindHost = autosshBindHost_.empty() ? "127.0.0.1" : autosshBindHost_;
+      int targetPort = autosshTargetPort_ > 0 ? autosshTargetPort_ : (connectPort > 0 ? connectPort : 22);
+
+      cfg.ssh_destination = destination.c_str();
+      cfg.target_host = targetHost.c_str();
+      cfg.target_port = static_cast<uint16_t>(targetPort);
+      cfg.bind_host = bindHost.c_str();
+      cfg.local_port = 0;
+      if (!autosshMonitorHost_.empty()) cfg.monitor_host = autosshMonitorHost_.c_str();
+      if (autosshMonitorPort_ > 0) cfg.monitor_port = static_cast<uint16_t>(autosshMonitorPort_);
+      if (autosshDisableMonitor_) cfg.flags |= AUTOSSH_SESSION_MONITOR_DISABLED;
+      cfg.start_timeout_ms = timeout_ > 0 ? timeout_ * 1000 : 15000;
+
+      std::vector<std::string> extraArgs = autosshExtraArgs_;
+      std::string portString;
+      if (autosshDestination_.empty() && port_ > 0) {
+        portString = std::to_string(port_);
+        extraArgs.emplace_back("-p");
+        extraArgs.emplace_back(portString);
+      }
+      std::vector<const char*> extraArgPtrs;
+      extraArgPtrs.reserve(extraArgs.size());
+      for (const auto& arg : extraArgs) extraArgPtrs.push_back(arg.c_str());
+      if (!extraArgPtrs.empty()) {
+        cfg.extra_ssh_args = extraArgPtrs.data();
+        cfg.extra_ssh_args_len = extraArgPtrs.size();
+      }
+
+      sess_->StopAutossh();
+      sess_->autossh_ = autossh_session_new(&cfg);
+      if (!sess_->autossh_) {
+        err_ = "autossh_session_new failed";
+        return;
+      }
+      if (autossh_session_start(sess_->autossh_) != 0) {
+        const char* msg = autossh_session_last_error(sess_->autossh_);
+        err_ = std::string("autossh start failed: ") + (msg ? msg : "unknown error");
+        sess_->StopAutossh();
+        return;
+      }
+
+      const char* localHost = autossh_session_bind_host(sess_->autossh_);
+      uint16_t localPort = autossh_session_local_port(sess_->autossh_);
+      if (!localHost || localPort == 0) {
+        err_ = "autossh did not provide a local endpoint";
+        sess_->StopAutossh();
+        return;
+      }
+      connectHost = localHost;
+      connectPort = static_cast<int>(localPort);
+
+      const char* none = "none";
+      ssh_options_set(s, SSH_OPTIONS_PROXYCOMMAND, none);
+      ssh_options_set(s, SSH_OPTIONS_PROXYJUMP, none);
+    }
+
+    if (ssh_options_set(s, SSH_OPTIONS_HOST, connectHost.c_str()) != SSH_OK) {
+      err_ = std::string("set connect host failed: ") + ssh_get_error(s);
+      if (useAutossh_) sess_->StopAutossh();
+      return;
+    }
+    if (connectPort > 0) {
+      unsigned int p = static_cast<unsigned int>(connectPort);
+      if (ssh_options_set(s, SSH_OPTIONS_PORT, &p) != SSH_OK) {
+        err_ = std::string("set connect port failed: ") + ssh_get_error(s);
+        if (useAutossh_) sess_->StopAutossh();
         return;
       }
     }
-    if (port_ > 0) {
-      unsigned int p = static_cast<unsigned int>(port_);
-      if (ssh_options_set(s, SSH_OPTIONS_PORT, &p) != SSH_OK) {
-        err_ = std::string("set port failed: ") + ssh_get_error(s);
+    if (!user_.empty()) {
+      if (ssh_options_set(s, SSH_OPTIONS_USER, user_.c_str()) != SSH_OK) {
+        err_ = std::string("set user failed: ") + ssh_get_error(s);
+        if (useAutossh_) sess_->StopAutossh();
         return;
       }
     }
 
     if (ssh_connect(s) != SSH_OK) {
       err_ = std::string("connect failed: ") + ssh_get_error(s);
+      if (useAutossh_) sess_->StopAutossh();
       return;
     }
 
@@ -116,6 +214,7 @@ public:
       if (known != SSH_KNOWN_HOSTS_OK) {
         ssh_disconnect(s);
         err_ = "host key not in known_hosts (set strictHostKeyChecking=false to accept)";
+        if (useAutossh_) sess_->StopAutossh();
         return;
       }
     }
@@ -126,6 +225,7 @@ public:
     if (rc != SSH_AUTH_SUCCESS) {
       err_ = std::string("authentication failed: ") + ssh_get_error(s);
       ssh_disconnect(s);
+      if (useAutossh_) sess_->StopAutossh();
       return;
     }
   }
@@ -148,6 +248,15 @@ private:
   std::string host_, user_;
   int port_, timeout_;
   bool acceptAnyHostKey_;
+  bool useAutossh_;
+  std::string autosshDestination_;
+  std::string autosshTargetHost_;
+  int autosshTargetPort_;
+  std::string autosshBindHost_;
+  std::string autosshMonitorHost_;
+  int autosshMonitorPort_;
+  bool autosshDisableMonitor_;
+  std::vector<std::string> autosshExtraArgs_;
   std::string err_;
 };
 
@@ -864,6 +973,15 @@ SshSession::~SshSession() {
     ssh_free(session_);
     session_ = nullptr;
   }
+  StopAutossh();
+}
+
+void SshSession::StopAutossh() {
+  if (autossh_) {
+    autossh_session_stop(autossh_);
+    autossh_session_free(autossh_);
+    autossh_ = nullptr;
+  }
 }
 
 Napi::Value SshSession::Connect(const Napi::CallbackInfo& info) {
@@ -874,8 +992,29 @@ Napi::Value SshSession::Connect(const Napi::CallbackInfo& info) {
   int port = opts.Has("port") ? opts.Get("port").As<Napi::Number>().Int32Value() : 0;
   int timeout = opts.Has("timeoutSec") ? opts.Get("timeoutSec").As<Napi::Number>().Int32Value() : 15;
   bool acceptAny = opts.Has("acceptAnyHostKey") ? opts.Get("acceptAnyHostKey").As<Napi::Boolean>().Value() : true;
+  bool useAutossh = opts.Has("useAutossh") ? opts.Get("useAutossh").As<Napi::Boolean>().Value() : true;
+  std::string autosshDestination = opts.Has("autosshDestination") ? opts.Get("autosshDestination").As<Napi::String>().Utf8Value() : "";
+  std::string autosshTargetHost = opts.Has("autosshTargetHost") ? opts.Get("autosshTargetHost").As<Napi::String>().Utf8Value() : "";
+  int autosshTargetPort = opts.Has("autosshTargetPort") ? opts.Get("autosshTargetPort").As<Napi::Number>().Int32Value() : 0;
+  std::string autosshBindHost = opts.Has("autosshBindHost") ? opts.Get("autosshBindHost").As<Napi::String>().Utf8Value() : "";
+  std::string autosshMonitorHost = opts.Has("autosshMonitorHost") ? opts.Get("autosshMonitorHost").As<Napi::String>().Utf8Value() : "";
+  int autosshMonitorPort = opts.Has("autosshMonitorPort") ? opts.Get("autosshMonitorPort").As<Napi::Number>().Int32Value() : 0;
+  bool autosshDisableMonitor = opts.Has("autosshDisableMonitor") ? opts.Get("autosshDisableMonitor").As<Napi::Boolean>().Value() : false;
+  std::vector<std::string> autosshExtraArgs;
+  if (opts.Has("autosshExtraArgs")) {
+    Napi::Array arr = opts.Get("autosshExtraArgs").As<Napi::Array>();
+    uint32_t len = arr.Length();
+    autosshExtraArgs.reserve(len);
+    for (uint32_t i = 0; i < len; i++) {
+      autosshExtraArgs.push_back(arr.Get(i).As<Napi::String>().Utf8Value());
+    }
+  }
 
-  auto* w = new ConnectWorker(env, this, host, user, port, timeout, acceptAny);
+  auto* w = new ConnectWorker(env, this, host, user, port, timeout, acceptAny,
+                              useAutossh, autosshDestination, autosshTargetHost,
+                              autosshTargetPort, autosshBindHost,
+                              autosshMonitorHost, autosshMonitorPort,
+                              autosshDisableMonitor, std::move(autosshExtraArgs));
   Napi::Promise p = w->GetPromise();
   w->Queue();
   return p;
@@ -990,6 +1129,7 @@ Napi::Value SshSession::End(const Napi::CallbackInfo& info) {
     ssh_free(session_);
     session_ = nullptr;
   }
+  StopAutossh();
   return info.Env().Undefined();
 }
 

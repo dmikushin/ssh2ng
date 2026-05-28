@@ -56,7 +56,22 @@ const native = require(findNativeAddon()) as {
 }
 
 interface NativeSession {
-  connect(opts: { host: string; username?: string; port?: number; timeoutSec?: number; acceptAnyHostKey?: boolean }): Promise<void>
+  connect(opts: {
+    host: string
+    username?: string
+    port?: number
+    timeoutSec?: number
+    acceptAnyHostKey?: boolean
+    useAutossh?: boolean
+    autosshDestination?: string
+    autosshTargetHost?: string
+    autosshTargetPort?: number
+    autosshBindHost?: string
+    autosshMonitorHost?: string
+    autosshMonitorPort?: number
+    autosshDisableMonitor?: boolean
+    autosshExtraArgs?: string[]
+  }): Promise<void>
   exec(cmd: string, stdin?: Buffer): Promise<{ stdout: Buffer; stderr: Buffer; code: number }>
   execStream(cmd: string, stdin?: Buffer): NativeExecChannel
   sftpInit(): Promise<void>
@@ -106,6 +121,26 @@ export interface ConnectConfig {
    *  known_hosts. Default true (accept any) for parity with our previous
    *  ssh2 wiring which also did not verify. */
   acceptAnyHostKey?: boolean
+  /** Use libautossh/OpenSSH as a supervised transport, then connect the
+   *  libssh backend to the returned localhost endpoint. Default true. */
+  useAutossh?: boolean
+  /** OpenSSH destination for the supervised transport. Defaults to `host`. */
+  autosshDestination?: string
+  /** Endpoint reached from the OpenSSH destination by the local forward.
+   *  Defaults to 127.0.0.1, i.e. the final server's local sshd. */
+  autosshTargetHost?: string
+  /** Forward target port. Defaults to `port` or 22. */
+  autosshTargetPort?: number
+  /** Local bind host for the endpoint consumed by libssh. Defaults to 127.0.0.1. */
+  autosshBindHost?: string
+  /** Host/interface used by autossh's monitor loop, passed as AUTOSSH_MHOST. */
+  autosshMonitorHost?: string
+  /** Base autossh monitor port. Default 0 lets libautossh pick one. */
+  autosshMonitorPort?: number
+  /** Equivalent to autossh -M 0. Default false. */
+  autosshDisableMonitor?: boolean
+  /** Extra OpenSSH arguments used by libautossh when starting the supervised tunnel. */
+  autosshExtraArgs?: string[]
 }
 
 /**
@@ -138,9 +173,18 @@ export class Client extends EventEmitter {
       host: config.host,
       timeoutSec,
       acceptAnyHostKey: config.acceptAnyHostKey ?? true,
+      useAutossh: config.useAutossh ?? true,
     }
     if (config.username !== undefined) nativeOpts.username = config.username
     if (config.port !== undefined) nativeOpts.port = config.port
+    if (config.autosshDestination !== undefined) nativeOpts.autosshDestination = config.autosshDestination
+    if (config.autosshTargetHost !== undefined) nativeOpts.autosshTargetHost = config.autosshTargetHost
+    if (config.autosshTargetPort !== undefined) nativeOpts.autosshTargetPort = config.autosshTargetPort
+    if (config.autosshBindHost !== undefined) nativeOpts.autosshBindHost = config.autosshBindHost
+    if (config.autosshMonitorHost !== undefined) nativeOpts.autosshMonitorHost = config.autosshMonitorHost
+    if (config.autosshMonitorPort !== undefined) nativeOpts.autosshMonitorPort = config.autosshMonitorPort
+    if (config.autosshDisableMonitor !== undefined) nativeOpts.autosshDisableMonitor = config.autosshDisableMonitor
+    if (config.autosshExtraArgs !== undefined) nativeOpts.autosshExtraArgs = config.autosshExtraArgs
 
     this.session.connect(nativeOpts).then(() => {
       this.connected = true
