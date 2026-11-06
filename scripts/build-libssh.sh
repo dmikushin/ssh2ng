@@ -25,6 +25,10 @@ if [ -f "$INSTALL_DIR/lib/libssh.a" ] && [ "${SSH2NG_FORCE_REBUILD:-}" != "1" ];
   exit 0
 fi
 
+# A forced rebuild starts from nothing. The CMake cache names the compiler it
+# was configured with, so one made on another system (a host's /usr/sbin/cc,
+# then a build in the release image) refuses to configure at all.
+rm -rf "$BUILD_DIR" "$INSTALL_DIR"
 mkdir -p "$BUILD_DIR"
 
 cmake -S vendor/libssh -B "$BUILD_DIR" \
